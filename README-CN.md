@@ -1026,4 +1026,4 @@ except NotImplementedError:
 
 ---
 
-**作者**：魏新宇 (Xinyu Wei)，Microsoft GBB AI Infrastructure；全炫相 (Hyeonsang Jeon)，Microsoft GBB AI Applications
+**作者**：魏新宇 (Xinyu Wei)，Microsoft GBB AI Infrastructure；全炫相 (Hyeonsang Jeon)，Microsoft GBB AI Applications 

@@ -12,7 +12,7 @@
 # Then load adapters dynamically:
 #   curl -X POST http://localhost:8080/v1/load_lora_adapter \
 #     -H "Content-Type: application/json" \
-#     -d '{"lora_name": "medical", "lora_path": "/data/lora-adapters/medical"}'
+#     -d '{"lora_name": "medical", "lora_path": "/data/lora-adapters/medical"}' 
 
 set -euo pipefail
 
