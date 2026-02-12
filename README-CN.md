@@ -12,6 +12,7 @@
 - [LoRA Adapter 创建](#lora-adapter-创建)
 - [训练真实 LoRA Adapter（SFT 微调）](#训练真实-lora-adaptersft-微调)
 - [Multi-LoRA 服务](#multi-lora-服务)
+- [动态 LoRA 服务（运行时热交换）](#动态-lora-服务运行时热交换)
 - [性能基准测试](#性能基准测试)
 - [推理质量示例 — LoRA 领域专业化效果](#推理质量示例--lora-领域专业化效果)
 - [Adapter 注册与缓存策略](#adapter-注册与缓存策略)
@@ -333,6 +334,147 @@ flowchart LR
 | KV cache (gpu_mem_util=0.5) | ~40.7 GiB |
 | LoRA adapter (4×168 MB) | ~0.66 GiB |
 | **合计** | **~50.7 GiB / 95.8 GiB** |
+
+## 动态 LoRA 服务（运行时热交换）
+
+上述 [Multi-LoRA 服务](#multi-lora-服务) 章节演示的是在服务器启动时 **静态** 注册 adapter，而生产环境通常需要 **动态** 管理 adapter — 在不重启 vLLM 服务器的情况下加载、卸载和更新 adapter。
+
+### 静态 vs 动态服务
+
+| 方面 | 静态 (`--lora-modules`) | 动态（运行时 API） |
+|------|--------------------------|----------------------|
+| **Adapter 注册** | 服务器启动时 | 通过 REST API 随时注册 |
+| **添加新 adapter** | 需要重启服务器 | 零停机热添加 |
+| **移除 adapter** | 需要重启服务器 | 即时卸载 |
+| **更新 adapter 权重** | 需要重启服务器 | 原地重载 |
+| **使用场景** | 固定 adapter 集合、简单运维 | 频繁重训练、多团队协作 |
+| **复杂度** | 低 | 中等（需要生命周期管理） |
+
+### 快速开始 — 动态模式
+
+**1. 不预注册 adapter 启动服务器：**
+
+```bash
+# 使用提供的脚本
+chmod +x scripts/start_dynamic_serving.sh
+./scripts/start_dynamic_serving.sh
+
+# 或手动启动：
+VLLM_ALLOW_RUNTIME_LORA_UPDATING=True \
+vllm serve /data/EXAONE-3.5-2.4B-Instruct \
+  --trust-remote-code \
+  --enable-lora \
+  --max-lora-rank 32 \
+  --max-loras 4 \
+  --max-cpu-loras 8 \
+  --gpu-memory-utilization 0.9 \
+  --dtype bfloat16 \
+  --port 8080
+```
+
+> **关键区别**：没有 `--lora-modules` 参数。服务器仅加载基座模型启动，adapter 按需加载。
+
+**2. 动态加载 adapter：**
+
+```bash
+# 加载 medical adapter
+curl -X POST http://localhost:8080/v1/load_lora_adapter \
+  -H "Content-Type: application/json" \
+  -d '{"lora_name": "medical", "lora_path": "/data/lora-adapters/medical"}'
+
+# 加载 legal adapter
+curl -X POST http://localhost:8080/v1/load_lora_adapter \
+  -H "Content-Type: application/json" \
+  -d '{"lora_name": "legal", "lora_path": "/data/lora-adapters/legal"}'
+
+# 验证已加载的 adapter
+curl http://localhost:8080/v1/models | python3 -m json.tool
+```
+
+**3. 使用 adapter（与静态模式相同）：**
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "medical",
+       "messages": [{"role": "user", "content": "2型糖尿病的症状有哪些？"}],
+       "max_tokens": 128}'
+```
+
+**4. 更新或移除 adapter：**
+
+```bash
+# 重训练后更新 adapter 权重（零停机）
+curl -X POST http://localhost:8080/v1/load_lora_adapter \
+  -H "Content-Type: application/json" \
+  -d '{"lora_name": "medical", "lora_path": "/data/lora-adapters/medical-v2", "load_inplace": true}'
+
+# 移除 adapter 以释放 GPU 显存
+curl -X POST http://localhost:8080/v1/unload_lora_adapter \
+  -H "Content-Type: application/json" \
+  -d '{"lora_name": "legal"}'
+```
+
+### Adapter 生命周期测试
+
+`test_dynamic_lora.py` 脚本验证完整的 adapter 生命周期：
+
+```bash
+# 运行完整生命周期测试（加载 → 查询 → 卸载 → 重载 → 清理）
+python scripts/test_dynamic_lora.py --test lifecycle
+
+# 多轮交换延迟基准测试
+python scripts/test_dynamic_lora.py --test swap --swap-cycles 10
+
+# 运行全部测试
+python scripts/test_dynamic_lora.py --test all
+```
+
+**生命周期测试验证项：**
+
+| 步骤 | 操作 | 验证 |
+|------|------|------|
+| 1 | 检查初始状态 | 仅基座模型已加载 |
+| 2 | 加载 4 个 adapter | 每个 adapter 加载成功，测量加载延迟 |
+| 3 | 验证模型列表 | 所有 adapter 出现在 `/v1/models` 中 |
+| 4 | 查询每个 adapter | 领域专属响应，测量推理延迟 |
+| 5 | 卸载一个 adapter | Adapter 从模型列表中移除 |
+| 6 | 查询已卸载的 adapter | 请求被正确拒绝（错误响应） |
+| 7 | 重新加载 adapter | 模拟版本更新，验证其恢复正常 |
+| 8 | 清理 | 卸载所有 adapter |
+
+**交换延迟基准测试** 通过 N 次迭代测量加载/卸载周期时间，量化运行时 adapter 管理的开销。
+
+### 生产环境注意事项
+
+在生产环境中使用动态服务时，请考虑以下因素：
+
+**处理中请求**：vLLM 会将正在加载/卸载的 adapter 的请求排队。对已完全卸载的 adapter 的请求将返回错误。请设计应用程序妥善处理 `404` 或 `400` 响应。
+
+**显存压力**：每个已加载的 adapter 会消耗 GPU VRAM（rank=32 约 168 MB）。当达到 `--max-loras` 上限时，必须卸载现有 adapter 才能加载新的。使用 `--max-cpu-loras` 启用 CPU 层缓存，用于频繁交换的 adapter。
+
+**Adapter 注册表模式**：对于拥有大量 adapter 的环境，建议实现外部注册表来跟踪：
+- 当前已加载的 adapter（轮询 `GET /v1/models`）
+- Adapter 版本元数据（训练配置、数据版本、指标）
+- 自动淘汰策略（LRU、基于优先级）
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Adapter    │     │    vLLM      │     │   Azure      │
+│   Registry   │────▶│   Server     │◀────│   Blob       │
+│  (metadata)  │     │ (GPU serving)│     │  (weights)   │
+└──────────────┘     └──────────────┘     └──────────────┘
+       │                                         │
+       └─── tracks loaded/version ───────────────┘
+```
+
+**回滚策略**：在 Azure Blob Storage 中保留先前的 adapter 版本。如果新部署的 adapter 表现不佳，通过加载先前版本进行回滚：
+
+```bash
+# 回滚：原地加载先前版本
+curl -X POST http://localhost:8080/v1/load_lora_adapter \
+  -d '{"lora_name": "medical", "lora_path": "/data/lora-adapters/medical-v1", "load_inplace": true}'
+```
 
 ## 性能基准测试
 
@@ -870,6 +1012,9 @@ except NotImplementedError:
 | `scripts/generate_training_data.py` | 使用 Azure OpenAI 生成训练数据（80 样本/领域） |
 | `scripts/test_multi_lora.py` | 验证所有 5 个模型（基座 + 4 LoRA）的推理 |
 | `scripts/benchmark_multi_lora.py` | 基准测试套件：顺序延迟、并发吞吐量、TTFT |
+| `scripts/test_dynamic_lora.py` | **动态 LoRA 生命周期测试 & 交换延迟基准测试** |
+| `scripts/start_dynamic_serving.sh` | 启动支持运行时 adapter 热交换的 vLLM 服务器 |
+
 
 ## 参考资料
 
@@ -881,4 +1026,4 @@ except NotImplementedError:
 
 ---
 
-**作者**：魏新宇 (Xinyu Wei)，Microsoft GBB AI Infrastructure
+**作者**：魏新宇 (Xinyu Wei)，Microsoft GBB AI Infrastructure；全炫相 (Hyeonsang Jeon)，Microsoft GBB AI Applications

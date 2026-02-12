@@ -12,6 +12,7 @@ This repository provides a **complete validation** of running LG AI Research's *
 - [LoRA Adapter Creation](#lora-adapter-creation)
 - [Training Real LoRA Adapters (SFT)](#training-real-lora-adapters-sft)
 - [Multi-LoRA Serving](#multi-lora-serving)
+- [Dynamic LoRA Serving (Runtime Hot-Swap)](#dynamic-lora-serving-runtime-hot-swap)
 - [Performance Benchmarks](#performance-benchmarks)
 - [Inference Quality Examples — LoRA Domain Specialization](#inference-quality-examples--lora-domain-specialization)
 - [Adapter Registry & Caching Strategy](#adapter-registry--caching-strategy)
@@ -333,6 +334,147 @@ When the server starts with 4 LoRA modules, the `/v1/models` endpoint returns 5 
 | KV cache (gpu_mem_util=0.5) | ~40.7 GiB |
 | LoRA adapters (4×168 MB) | ~0.66 GiB |
 | **Total** | **~50.7 GiB / 95.8 GiB** |
+
+## Dynamic LoRA Serving (Runtime Hot-Swap)
+
+While the [Multi-LoRA Serving](#multi-lora-serving) section above demonstrates **static** adapter registration at server startup, production environments often require **dynamic** adapter management — loading, unloading, and updating adapters without restarting the vLLM server.
+
+### Static vs Dynamic Serving
+
+| Aspect | Static (`--lora-modules`) | Dynamic (Runtime API) |
+|--------|--------------------------|----------------------|
+| **Adapter registration** | At server startup | Anytime via REST API |
+| **Adding new adapters** | Requires server restart | Zero-downtime hot-add |
+| **Removing adapters** | Requires server restart | Instant unload |
+| **Updating adapter weights** | Requires server restart | In-place reload |
+| **Use case** | Fixed adapter set, simple ops | Frequent retraining, multi-team |
+| **Complexity** | Low | Medium (needs lifecycle management) |
+
+### Quick Start — Dynamic Mode
+
+**1. Start the server without pre-registered adapters:**
+
+```bash
+# Using the provided script
+chmod +x scripts/start_dynamic_serving.sh
+./scripts/start_dynamic_serving.sh
+
+# Or manually:
+VLLM_ALLOW_RUNTIME_LORA_UPDATING=True \
+vllm serve /data/EXAONE-3.5-2.4B-Instruct \
+  --trust-remote-code \
+  --enable-lora \
+  --max-lora-rank 32 \
+  --max-loras 4 \
+  --max-cpu-loras 8 \
+  --gpu-memory-utilization 0.9 \
+  --dtype bfloat16 \
+  --port 8080
+```
+
+> **Key difference**: No `--lora-modules` flag. The server starts with only the base model. Adapters are loaded on demand.
+
+**2. Load adapters dynamically:**
+
+```bash
+# Load medical adapter
+curl -X POST http://localhost:8080/v1/load_lora_adapter \
+  -H "Content-Type: application/json" \
+  -d '{"lora_name": "medical", "lora_path": "/data/lora-adapters/medical"}'
+
+# Load legal adapter
+curl -X POST http://localhost:8080/v1/load_lora_adapter \
+  -H "Content-Type: application/json" \
+  -d '{"lora_name": "legal", "lora_path": "/data/lora-adapters/legal"}'
+
+# Verify loaded adapters
+curl http://localhost:8080/v1/models | python3 -m json.tool
+```
+
+**3. Use adapters (same as static mode):**
+
+```bash
+curl http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "medical",
+       "messages": [{"role": "user", "content": "Symptoms of Type 2 diabetes?"}],
+       "max_tokens": 128}'
+```
+
+**4. Update or remove adapters:**
+
+```bash
+# Update adapter weights after retraining (zero-downtime)
+curl -X POST http://localhost:8080/v1/load_lora_adapter \
+  -H "Content-Type: application/json" \
+  -d '{"lora_name": "medical", "lora_path": "/data/lora-adapters/medical-v2", "load_inplace": true}'
+
+# Remove an adapter to free GPU memory
+curl -X POST http://localhost:8080/v1/unload_lora_adapter \
+  -H "Content-Type: application/json" \
+  -d '{"lora_name": "legal"}'
+```
+
+### Adapter Lifecycle Test
+
+The `test_dynamic_lora.py` script validates the full adapter lifecycle:
+
+```bash
+# Run full lifecycle test (load → query → unload → reload → cleanup)
+python scripts/test_dynamic_lora.py --test lifecycle
+
+# Benchmark swap latency over multiple cycles
+python scripts/test_dynamic_lora.py --test swap --swap-cycles 10
+
+# Run both tests
+python scripts/test_dynamic_lora.py --test all
+```
+
+**Lifecycle test validates:**
+
+| Step | Action | Validation |
+|------|--------|------------|
+| 1 | Check initial state | Only base model loaded |
+| 2 | Load 4 adapters | Each adapter loads successfully, measure load latency |
+| 3 | Verify models | All adapters appear in `/v1/models` |
+| 4 | Query each adapter | Domain-specific responses, measure inference latency |
+| 5 | Unload one adapter | Adapter removed from model list |
+| 6 | Query unloaded adapter | Request correctly rejected (error response) |
+| 7 | Reload adapter | Simulates version update, verify it works again |
+| 8 | Cleanup | Unload all adapters |
+
+**Swap latency benchmark** measures load/unload cycle times across N iterations to quantify the overhead of runtime adapter management.
+
+### Production Considerations
+
+When using dynamic serving in production, consider these additional factors:
+
+**In-flight request handling**: vLLM queues requests for adapters that are being loaded/unloaded. Requests to a fully unloaded adapter return an error. Design your application to handle `404` or `400` responses gracefully.
+
+**Memory pressure**: Each loaded adapter consumes GPU VRAM (~168 MB for rank=32). If `--max-loras` is reached, you must unload an existing adapter before loading a new one. Use `--max-cpu-loras` to enable CPU-tier caching for frequently swapped adapters.
+
+**Adapter registry pattern**: For environments with many adapters, consider implementing an external registry that tracks:
+- Which adapters are currently loaded (poll `GET /v1/models`)
+- Adapter version metadata (training config, data version, metrics)
+- Auto-eviction policy (LRU, priority-based)
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Adapter    │     │    vLLM      │     │   Azure      │
+│   Registry   │────▶│   Server     │◀────│   Blob       │
+│  (metadata)  │     │ (GPU serving)│     │  (weights)   │
+└──────────────┘     └──────────────┘     └──────────────┘
+       │                                         │
+       └─── tracks loaded/version ───────────────┘
+```
+
+**Rollback strategy**: Keep previous adapter versions in Azure Blob Storage. If a newly deployed adapter underperforms, rollback by loading the previous version:
+
+```bash
+# Rollback: load previous version in-place
+curl -X POST http://localhost:8080/v1/load_lora_adapter \
+  -d '{"lora_name": "medical", "lora_path": "/data/lora-adapters/medical-v1", "load_inplace": true}'
+```
 
 ## Performance Benchmarks
 
@@ -872,6 +1014,9 @@ except NotImplementedError:
 | `scripts/test_multi_lora.py` | Validates inference across all 5 models (base + 4 LoRA) |
 | `scripts/benchmark_multi_lora.py` | Benchmark suite: sequential latency, concurrent throughput, TTFT |
 
+| `scripts/test_dynamic_lora.py` | **Dynamic LoRA lifecycle test & swap latency benchmark** |
+| `scripts/start_dynamic_serving.sh` | Launch vLLM server with runtime adapter hot-swap enabled |
+
 ## References
 
 - [vLLM Documentation - LoRA Serving](https://docs.vllm.ai/en/latest/features/lora.html)
@@ -882,4 +1027,4 @@ except NotImplementedError:
 
 ---
 
-**Author**: Xinyu Wei (Microsoft GBB AI Infrastructure)
+**Author**: Xinyu Wei (Microsoft GBB AI Infrastructure), Hyeonsang Jeon (Microsoft GBB AI Applications)
